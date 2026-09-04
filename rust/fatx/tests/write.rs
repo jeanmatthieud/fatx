@@ -548,3 +548,32 @@ fn reading_a_file_the_image_is_too_short_to_hold_does_not_hang() {
     assert_eq!(contents.len(), 512, "only what the image actually holds");
     assert!(contents.iter().all(|&b| b == 0x42));
 }
+
+#[test]
+fn free_space_follows_what_the_clusters_are_doing() {
+    for variant in both_variants() {
+        let image = Image::new("space", variant);
+        let mut fs = image.open(variant, true);
+
+        // A blank filesystem has nothing allocated: entries 0 and 1 are the
+        // media descriptor and the root directory, and neither is counted.
+        let empty = fs.space().unwrap();
+        assert_eq!(empty.bytes_per_cluster, BYTES_PER_CLUSTER);
+        assert_eq!(empty.free_bytes, empty.total_bytes);
+        assert_eq!(empty.used_bytes(), 0);
+        // The data area is smaller than the partition: the superblock and the
+        // FAT sit in front of it.
+        assert!(empty.total_bytes < PARTITION_SIZE);
+
+        // Two clusters of payload cost two clusters, however few bytes of the
+        // second one are actually used.
+        write_file(&mut fs, "/BIG.BIN", &vec![0x11u8; BYTES_PER_CLUSTER as usize + 1]);
+        let filled = fs.space().unwrap();
+        assert_eq!(filled.used_bytes(), 2 * BYTES_PER_CLUSTER);
+        assert_eq!(filled.total_bytes, empty.total_bytes);
+
+        // And they come back when it goes away.
+        fs.unlink("/BIG.BIN").unwrap();
+        assert_eq!(fs.space().unwrap(), empty);
+    }
+}

@@ -56,6 +56,23 @@ impl Superblock {
     }
 }
 
+/// Space accounting for a whole filesystem, in bytes.
+///
+/// `total_bytes` is what the data area can hold, so it is smaller than the
+/// partition: the superblock and the FAT itself are not part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub bytes_per_cluster: u64,
+}
+
+impl Space {
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.free_bytes)
+    }
+}
+
 #[derive(Debug)]
 pub struct FatxFs {
     self_handle: Weak<Mutex<FatxFs>>,
@@ -302,6 +319,30 @@ impl FatxFs {
             self.handle(),
             dirent.first_cluster(),
         ))
+    }
+
+    /// How much of the filesystem is in use.
+    ///
+    /// Counted by walking the FAT rather than by adding up file sizes: the
+    /// answer must match what the console will report, and that is a question
+    /// about clusters, not about bytes. Entries 0 and 1 hold the media
+    /// descriptor and the root directory, so neither counts as space a caller
+    /// could ever fill.
+    pub(crate) fn space(&mut self) -> Result<Space, Error> {
+        let last = self.num_clusters;
+        let mut free: u64 = 0;
+        for index in FATX_FIRST_ALLOCATABLE_CLUSTER..last {
+            if self.fat.entry(index, self.variant)? == FatEntry::Available {
+                free += 1;
+            }
+        }
+
+        let total = u64::from(last.saturating_sub(FATX_FIRST_ALLOCATABLE_CLUSTER));
+        Ok(Space {
+            total_bytes: total * self.num_bytes_per_cluster,
+            free_bytes: free * self.num_bytes_per_cluster,
+            bytes_per_cluster: self.num_bytes_per_cluster,
+        })
     }
 
     // -- Writing ------------------------------------------------------------
@@ -823,6 +864,14 @@ impl FatxFsHandle {
     /// Flush everything held in memory to the device.
     pub fn sync(&mut self) -> Result<(), Error> {
         self.with_lock(|fs| fs.sync())
+    }
+
+    /// Total and free space, in bytes.
+    ///
+    /// Walks the whole FAT, so this is a deliberate call rather than something
+    /// to put in a loop.
+    pub fn space(&mut self) -> Result<Space, Error> {
+        self.with_lock(|fs| fs.space())
     }
 
     /// Whether this filesystem was opened for writing.
