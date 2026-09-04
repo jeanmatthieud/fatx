@@ -1,6 +1,6 @@
-use chrono::NaiveDate;
+use chrono::{DateTime as ChronoDateTime, Datelike, Local, NaiveDate, Timelike};
 use std::ffi::OsStr;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -10,10 +10,13 @@ use clap::Parser;
 use clap::builder::styling::{AnsiColor, Effects, Style, Styles};
 use fatx::{DirectoryEntry, FatxFs, FatxFsConfig, FatxFsHandle};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
 };
-use libc::ENOENT;
+use libc::{
+    EBUSY, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+    EROFS,
+};
 
 type Inode = u64;
 
@@ -50,6 +53,86 @@ impl InodeTracker {
         let bimap = self.bimap.lock().unwrap();
         bimap.get_by_left(&inode).cloned()
     }
+
+    /// Forget a path that no longer exists.
+    fn forget_path(&self, path: &str) {
+        let mut bimap = self.bimap.lock().unwrap();
+        bimap.remove_by_right(path);
+    }
+
+    /// Follow a path that has moved, along with everything beneath it.
+    ///
+    /// Renaming a directory moves every path under it, and those paths are what
+    /// this map is keyed by, so they all have to be rewritten or the inodes
+    /// they belong to would resolve to somewhere that no longer exists.
+    fn rename_path(&self, from: &str, to: &str) {
+        let mut bimap = self.bimap.lock().unwrap();
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+
+        let moved: Vec<(Inode, String)> = bimap
+            .iter()
+            .filter(|(_, path)| path.as_str() == from || path.starts_with(&prefix))
+            .map(|(inode, path)| (*inode, path.clone()))
+            .collect();
+
+        for (inode, path) in moved {
+            let new_path = if path == from {
+                to.to_string()
+            } else {
+                format!("{}{}", to, &path[from.len()..])
+            };
+            bimap.remove_by_left(&inode);
+            bimap.remove_by_right(&new_path);
+            bimap.insert(inode, new_path);
+        }
+    }
+}
+
+/// Translate a library error into the errno FUSE has to answer with.
+fn errno(err: fatx::Error) -> libc::c_int {
+    match err {
+        fatx::Error::NotFound => ENOENT,
+        fatx::Error::NotADirectory => ENOTDIR,
+        fatx::Error::IsADirectory => EISDIR,
+        fatx::Error::AlreadyExists => EEXIST,
+        fatx::Error::DirectoryNotEmpty => ENOTEMPTY,
+        fatx::Error::NoSpaceLeft => ENOSPC,
+        fatx::Error::ReadOnlyFilesystem => EROFS,
+        fatx::Error::InvalidFileName => ENAMETOOLONG,
+        fatx::Error::IsRootDirectory => EBUSY,
+        fatx::Error::FileTooLarge => EFBIG,
+        fatx::Error::InvalidRename => EINVAL,
+        fatx::Error::Io(err) => io_errno(err),
+        _ => EIO,
+    }
+}
+
+/// Translate an I/O error into an errno.
+///
+/// An error that came from a system call carries its errno; one the library
+/// built for itself does not, so its kind is mapped back to the errno it was
+/// made from. Without that every failure of a read or a write would be reported
+/// as a plain EIO.
+fn io_errno(err: std::io::Error) -> libc::c_int {
+    use std::io::ErrorKind;
+
+    if let Some(errno) = err.raw_os_error() {
+        return errno;
+    }
+
+    match err.kind() {
+        ErrorKind::NotFound => ENOENT,
+        ErrorKind::NotADirectory => ENOTDIR,
+        ErrorKind::IsADirectory => EISDIR,
+        ErrorKind::AlreadyExists => EEXIST,
+        ErrorKind::DirectoryNotEmpty => ENOTEMPTY,
+        ErrorKind::StorageFull => ENOSPC,
+        ErrorKind::ReadOnlyFilesystem => EROFS,
+        ErrorKind::FileTooLarge => EFBIG,
+        ErrorKind::InvalidInput => EINVAL,
+        ErrorKind::PermissionDenied => EBUSY,
+        _ => EIO,
+    }
 }
 
 struct FuseFatxFs {
@@ -58,6 +141,35 @@ struct FuseFatxFs {
     inodes: InodeTracker,
 }
 
+/// Break a wall-clock instant down the way a FATX timestamp stores it.
+///
+/// FATX has no time zone of its own: the consoles write local time, so that is
+/// what an incoming timestamp is converted to.
+fn systemtime_to_fatx_datetime(time: SystemTime) -> fatx::DateTime {
+    let local: ChronoDateTime<Local> = time.into();
+    fatx::DateTime::new(
+        local.year() as u16,
+        local.month() as u8,
+        local.day() as u8,
+        local.hour() as u8,
+        local.minute() as u8,
+        local.second() as u8,
+    )
+}
+
+fn time_or_now_to_fatx_datetime(time: TimeOrNow) -> fatx::DateTime {
+    match time {
+        TimeOrNow::SpecificTime(time) => systemtime_to_fatx_datetime(time),
+        TimeOrNow::Now => fatx::DateTime::now(),
+    }
+}
+
+/// The instant a FATX timestamp names.
+///
+/// The stamps hold local wall-clock time, which is what the consoles write and
+/// what `systemtime_to_fatx_datetime` puts back, so they are read in the local
+/// zone too. Reading them as UTC would skew every timestamp the driver reports
+/// by the machine's offset.
 fn fatx_datetime_to_systemtime(datetime: fatx::DateTime) -> SystemTime {
     if let Some(date) = NaiveDate::from_ymd_opt(
         datetime.year().into(),
@@ -67,8 +179,9 @@ fn fatx_datetime_to_systemtime(datetime: fatx::DateTime) -> SystemTime {
         datetime.hour().into(),
         datetime.minute().into(),
         datetime.second().into(),
-    ) {
-        return SystemTime::from(datetime.and_utc());
+    ) && let Some(datetime) = datetime.and_local_timezone(Local).earliest()
+    {
+        return SystemTime::from(datetime);
     }
 
     // Failed to convert datetime. Supply default.
@@ -80,6 +193,23 @@ fn fatx_datetime_to_systemtime(datetime: fatx::DateTime) -> SystemTime {
 }
 
 impl FuseFatxFs {
+    /// Build the path of a name inside a directory known by its inode.
+    fn child_path(&self, parent: Inode, name: &OsStr) -> Option<String> {
+        let parent = self.inodes.get_path(parent)?;
+        let mut path = PathBuf::from(parent);
+        path.push(name.to_str()?);
+        path.to_str().map(String::from)
+    }
+
+    /// Answer with the attributes of a path that has just been created or
+    /// changed, looking it up again so the reply carries what is on disk.
+    fn reply_with_entry(&mut self, path: &str) -> Result<(Inode, FileAttr), libc::c_int> {
+        let dirent = self.fatx.stat(path).map_err(errno)?;
+        let inode = self.inodes.get_or_create_inode(path);
+        let attr = self.dirent_to_attr(inode, &dirent).ok_or(EIO)?;
+        Ok((inode, attr))
+    }
+
     fn dirent_to_attr(&mut self, inode: u64, dirent: &DirectoryEntry) -> Option<FileAttr> {
         if dirent.is_directory() {
             return Some(FileAttr {
@@ -149,12 +279,12 @@ impl Filesystem for FuseFatxFs {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         log::debug!("getattr({})", ino);
-        if let Some(path) = self.inodes.get_path(ino) {
-            let dirent = self.fatx.stat(&path).expect("failed to stat");
-            if let Some(attr) = self.dirent_to_attr(ino, &dirent) {
-                reply.attr(&TTL, &attr);
-                return;
-            }
+        if let Some(path) = self.inodes.get_path(ino)
+            && let Ok(dirent) = self.fatx.stat(&path)
+            && let Some(attr) = self.dirent_to_attr(ino, &dirent)
+        {
+            reply.attr(&TTL, &attr);
+            return;
         }
         reply.error(ENOENT);
     }
@@ -171,19 +301,27 @@ impl Filesystem for FuseFatxFs {
         reply: ReplyData,
     ) {
         log::debug!("read({})", ino);
-        if let Some(path) = self.inodes.get_path(ino) {
-            let mut file = self.fatx.open(&path).unwrap();
-            file.seek(std::io::SeekFrom::Start(offset as u64))
-                .expect("failed to seek");
-
-            let mut data = vec![0u8; _size as usize];
-            _ = file.read(&mut data).unwrap();
-
-            reply.data(&data);
+        let Some(path) = self.inodes.get_path(ino) else {
+            reply.error(ENOENT);
             return;
-        }
+        };
 
-        reply.error(ENOENT);
+        let read = (|| -> std::io::Result<Vec<u8>> {
+            let mut file = self.fatx.open(&path)?;
+            file.seek(std::io::SeekFrom::Start(offset as u64))?;
+
+            // A short read is normal at the end of the file, so the reply
+            // carries only what was actually there.
+            let mut data = vec![0u8; _size as usize];
+            let len = file.read(&mut data)?;
+            data.truncate(len);
+            Ok(data)
+        })();
+
+        match read {
+            Ok(data) => reply.data(&data),
+            Err(err) => reply.error(io_errno(err)),
+        }
     }
 
     fn readdir(
@@ -242,6 +380,246 @@ impl Filesystem for FuseFatxFs {
             reply.ok();
         }
     }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        log::debug!("create({}, {:?})", parent, name);
+        let Some(path) = self.child_path(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        if let Err(err) = self.fatx.create(&path) {
+            reply.error(errno(err));
+            return;
+        }
+
+        match self.reply_with_entry(&path) {
+            Ok((_, attr)) => reply.created(&TTL, &attr, 0, 0, 0),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        log::debug!("write({}, offset={}, len={})", ino, offset, data.len());
+        let Some(path) = self.inodes.get_path(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let written = (|| -> std::io::Result<usize> {
+            let mut file = self.fatx.open(&path)?;
+            file.seek(std::io::SeekFrom::Start(offset as u64))?;
+            file.write_all(data)?;
+            Ok(data.len())
+        })();
+
+        match written {
+            Ok(len) => reply.written(len as u32),
+            Err(err) => reply.error(io_errno(err)),
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        log::debug!("mkdir({}, {:?})", parent, name);
+        let Some(path) = self.child_path(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        if let Err(err) = self.fatx.mkdir(&path) {
+            reply.error(errno(err));
+            return;
+        }
+
+        match self.reply_with_entry(&path) {
+            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        log::debug!("unlink({}, {:?})", parent, name);
+        let Some(path) = self.child_path(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        match self.fatx.unlink(&path) {
+            Ok(()) => {
+                self.inodes.forget_path(&path);
+                reply.ok()
+            }
+            Err(err) => reply.error(errno(err)),
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        log::debug!("rmdir({}, {:?})", parent, name);
+        let Some(path) = self.child_path(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        match self.fatx.rmdir(&path) {
+            Ok(()) => {
+                self.inodes.forget_path(&path);
+                reply.ok()
+            }
+            Err(err) => reply.error(errno(err)),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        log::debug!(
+            "rename({}, {:?} -> {}, {:?})",
+            parent,
+            name,
+            newparent,
+            newname
+        );
+
+        // renameat2 asks for guarantees this driver cannot make: RENAME_NOREPLACE
+        // must not clobber the destination and RENAME_EXCHANGE must swap the two
+        // atomically, and rename here always replaces. Refusing lets the caller
+        // fall back rather than quietly doing the opposite of what it asked.
+        if flags != 0 {
+            reply.error(EINVAL);
+            return;
+        }
+        let (Some(from), Some(to)) = (
+            self.child_path(parent, name),
+            self.child_path(newparent, newname),
+        ) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        match self.fatx.rename(&from, &to) {
+            Ok(()) => {
+                self.inodes.rename_path(&from, &to);
+                reply.ok()
+            }
+            Err(err) => reply.error(errno(err)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        log::debug!("setattr({}, size={:?})", ino, size);
+        let Some(path) = self.inodes.get_path(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        // Ownership and permissions have nowhere to go on this filesystem, so
+        // they are quietly accepted; what can be honoured is honoured.
+        if let Some(size) = size
+            && let Err(err) = self.fatx.truncate(&path, size)
+        {
+            reply.error(errno(err));
+            return;
+        }
+
+        if (atime.is_some() || mtime.is_some())
+            && let Err(err) = self.fatx.set_times(
+                &path,
+                atime.map(time_or_now_to_fatx_datetime),
+                mtime.map(time_or_now_to_fatx_datetime),
+            )
+        {
+            reply.error(errno(err));
+            return;
+        }
+
+        match self.reply_with_entry(&path) {
+            Ok((_, attr)) => reply.attr(&TTL, &attr),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        match self.fatx.sync() {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(errno(err)),
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.fatx.sync() {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(errno(err)),
+        }
+    }
+
+    /// Everything written is already on the device by the time the call that
+    /// wrote it returns, so unmounting only has to ask the device itself to
+    /// persist what it is still holding.
+    fn destroy(&mut self) {
+        if let Err(err) = self.fatx.sync() {
+            log::error!("failed to flush the filesystem on unmount: {err}");
+        }
+    }
 }
 
 const HEADER: Style = AnsiColor::Green.on_default().effects(Effects::BOLD);
@@ -298,6 +676,11 @@ struct Cli {
     #[arg(long)]
     size: Option<u64>,
 
+    /// Mount read-write. Off by default: writing to a console's disk is not
+    /// something to do by accident, and a read-only mount cannot damage it.
+    #[arg(long)]
+    read_write: bool,
+
     /// Auto-unmount
     #[arg(long)]
     auto_unmount: bool,
@@ -310,7 +693,12 @@ struct Cli {
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
-    let mut options = vec![MountOption::RO, MountOption::FSName("fatx".to_string())];
+    let mut options = vec![MountOption::FSName("fatx".to_string())];
+    options.push(if cli.read_write {
+        MountOption::RW
+    } else {
+        MountOption::RO
+    });
     if cli.auto_unmount {
         options.push(MountOption::AutoUnmount);
     }
@@ -331,7 +719,9 @@ fn main() {
         _ => None,
     };
 
-    let mut config = FatxFsConfig::new(cli.device_path).variant(variant);
+    let mut config = FatxFsConfig::new(cli.device_path)
+        .variant(variant)
+        .writable(cli.read_write);
     config = match (cli.offset, cli.size, &partition) {
         (Some(offset), Some(size), _) => config
             .partition_offset_bytes(offset)

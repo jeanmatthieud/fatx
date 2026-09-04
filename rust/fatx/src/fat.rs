@@ -1,3 +1,5 @@
+use std::io::{Seek, SeekFrom, Write};
+
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::*;
 
@@ -10,7 +12,7 @@ enum FatType {
     Type32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FatEntry {
     Available,
     Reserved,
@@ -52,11 +54,36 @@ impl From<u32> for FatEntry {
     }
 }
 
+impl FatEntry {
+    /// The 32-bit value this entry is written as.
+    ///
+    /// The markers are the same in both FAT widths once the narrow ones have
+    /// been widened, so a FAT16 filesystem simply truncates the result.
+    fn to_raw(self) -> Result<u32, Error> {
+        Ok(match self {
+            FatEntry::Available => 0x00000000,
+            FatEntry::Reserved => 0xfffffff0,
+            FatEntry::Bad => 0xfffffff7,
+            FatEntry::Media => 0xfffffff8,
+            FatEntry::End => 0xffffffff,
+            FatEntry::Data(cluster) => {
+                if cluster == 0 || cluster >= 0xfffffff0 {
+                    return Err(Error::InvalidClusterNumber);
+                }
+                cluster
+            }
+            FatEntry::Invalid => return Err(Error::InvalidClusterChain),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Fat {
     fat_type: FatType,
     pub(crate) fat_size_bytes: u64,
     pub(crate) fat_data: Vec<u8>, // FIXME: Smarter cache
+    /// Half-open byte range of `fat_data` modified since the last flush.
+    dirty: Option<(usize, usize)>,
 }
 
 impl Fat {
@@ -80,6 +107,15 @@ impl Fat {
             fat_type,
             fat_size_bytes,
             fat_data,
+            dirty: None,
+        }
+    }
+
+    /// The width, in bytes, of one entry of this FAT.
+    fn entry_size(&self) -> usize {
+        match self.fat_type {
+            FatType::Type16 => 2,
+            FatType::Type32 => 4,
         }
     }
 
@@ -111,5 +147,70 @@ impl Fat {
                 Ok(value.into())
             }
         }
+    }
+
+    /// Write a FAT entry into the cache, to be flushed later.
+    ///
+    /// As with reading, the cache is kept in on-disk byte order, so the value
+    /// is swapped on its way in.
+    pub(crate) fn set_entry(
+        &mut self,
+        index: FatEntryId,
+        entry: FatEntry,
+        variant: Variant,
+    ) -> Result<(), Error> {
+        let swap = variant.needs_swap();
+        let raw = entry.to_raw()?;
+        let offset = index as usize * self.entry_size();
+
+        match self.fat_type {
+            FatType::Type16 => {
+                let value = raw as u16;
+                let value = if swap { value.swap_bytes() } else { value };
+                let fat = <[U16]>::mut_from_bytes_with_elems(
+                    &mut self.fat_data[..],
+                    (self.fat_size_bytes / 2) as usize,
+                )
+                .unwrap();
+                fat[index as usize] = value.into();
+            }
+            FatType::Type32 => {
+                let value = if swap { raw.swap_bytes() } else { raw };
+                let fat = <[U32]>::mut_from_bytes_with_elems(
+                    &mut self.fat_data[..],
+                    (self.fat_size_bytes / 4) as usize,
+                )
+                .unwrap();
+                fat[index as usize] = value.into();
+            }
+        }
+
+        let end = offset + self.entry_size();
+        self.dirty = Some(match self.dirty {
+            Some((start, prev_end)) => (start.min(offset), prev_end.max(end)),
+            None => (offset, end),
+        });
+
+        Ok(())
+    }
+
+    /// Write the modified part of the cached FAT back to the device.
+    ///
+    /// Only the range touched since the last flush is written, so a single
+    /// entry change does not rewrite a FAT that may be megabytes long.
+    pub(crate) fn flush<D: Write + Seek>(
+        &mut self,
+        device: &mut D,
+        fat_offset_bytes: u64,
+    ) -> Result<(), Error> {
+        let Some((start, end)) = self.dirty else {
+            return Ok(());
+        };
+
+        device.seek(SeekFrom::Start(fat_offset_bytes + start as u64))?;
+        device.write_all(&self.fat_data[start..end])?;
+        self.dirty = None;
+
+        Ok(())
     }
 }

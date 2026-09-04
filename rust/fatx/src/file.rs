@@ -1,25 +1,41 @@
 use std::cmp::min;
 use std::io;
 
-use crate::dir::DirectoryEntry;
-use crate::fat::{ClusterId, FatEntry};
-use crate::fs::FatxFsHandle;
+use crate::datetime::DateTime;
+use crate::dir::{DirectoryEntry, EntryLocation};
+use crate::error::Error;
+use crate::fat::ClusterId;
+use crate::fs::{FatxFs, FatxFsHandle};
 
+/// An open file.
+///
+/// Each handle carries its own copy of the directory entry and writes the whole
+/// of it back after a write, so two handles open on the same path will overwrite
+/// each other's idea of the file's size. Open a path once at a time.
 pub struct File {
     handle: FatxFsHandle,
     dirent: DirectoryEntry,
+    /// Where the entry describing this file lives, so that its size and
+    /// timestamps can be written back. The root directory has no entry, but a
+    /// File is only ever opened on a regular file, which always has one.
+    location: Option<EntryLocation>,
     cur_cluster_relative: u32,
     cur_cluster_absolute: ClusterId,
     seek_pos: u32,
 }
 
 impl File {
-    pub(crate) fn new(handle: FatxFsHandle, dirent: DirectoryEntry) -> Self {
+    pub(crate) fn new(
+        handle: FatxFsHandle,
+        dirent: DirectoryEntry,
+        location: Option<EntryLocation>,
+    ) -> Self {
         Self {
             handle,
             seek_pos: 0,
             cur_cluster_relative: 0,
             cur_cluster_absolute: dirent.first_cluster(),
+            location,
             dirent,
         }
     }
@@ -27,35 +43,99 @@ impl File {
     pub fn file_size(&self) -> u32 {
         self.dirent.file_size()
     }
+
+    /// Map the current file position to a cluster, walking the chain from
+    /// wherever the last access left off.
+    ///
+    /// With `alloc` set, the chain is extended to reach the position, which is
+    /// what writing past the last cluster of a file needs.
+    fn cluster_at_seek_pos(&mut self, fs: &mut FatxFs, alloc: bool) -> Result<ClusterId, Error> {
+        let target_relative = (self.seek_pos as u64 / fs.num_bytes_per_cluster) as u32;
+
+        // Check if we need to begin scanning from start of cluster chain
+        if target_relative < self.cur_cluster_relative {
+            self.cur_cluster_relative = 0;
+            self.cur_cluster_absolute = self.dirent.first_cluster();
+        }
+
+        // Scan through the cluster chain
+        for _ in self.cur_cluster_relative..target_relative {
+            self.cur_cluster_absolute = match fs.next_cluster(self.cur_cluster_absolute)? {
+                Some(cluster) => cluster,
+                None if alloc => {
+                    let cluster = fs.alloc_cluster(true)?;
+                    fs.attach_cluster(self.cur_cluster_absolute, cluster)?;
+                    cluster
+                }
+                None => return Err(Error::InvalidClusterChain),
+            };
+            self.cur_cluster_relative += 1;
+        }
+
+        Ok(self.cur_cluster_absolute)
+    }
+
+    /// Grow the file to `new_size`, backing the new space with zeroes.
+    ///
+    /// Only the size held in the entry is updated; it reaches the disk when the
+    /// entry is written back.
+    fn extend_to(&mut self, fs: &mut FatxFs, new_size: u64) -> Result<(), Error> {
+        let old_size = self.dirent.file_size() as u64;
+        if new_size <= old_size {
+            return Ok(());
+        }
+
+        let first_cluster = self.dirent.first_cluster();
+
+        // Walking to the last byte allocates every cluster the new size needs.
+        fs.cluster_for_offset(first_cluster, new_size - 1, true)?;
+
+        // Those clusters are handed out zeroed, so all that is left is the
+        // unused tail of the cluster the file used to end in.
+        let tail_cluster = fs.cluster_for_offset(first_cluster, old_size, false)?;
+        let tail_offset = old_size % fs.num_bytes_per_cluster;
+        let len = (fs.num_bytes_per_cluster - tail_offset).min(new_size - old_size);
+        fs.zero_range(tail_cluster, tail_offset, len)?;
+
+        self.dirent.set_file_size(new_size as u32);
+        Ok(())
+    }
+
+    /// Write the entry back, recording the file's size and the fact that it was
+    /// just touched.
+    fn commit(&mut self, fs: &mut FatxFs) -> Result<(), Error> {
+        let location = self.location.ok_or(Error::NotFound)?;
+        let now = DateTime::now();
+        self.dirent.set_modified(&now, fs.variant);
+        self.dirent.set_accessed(&now, fs.variant);
+        self.dirent.write_at(fs, location)?;
+        fs.flush_fat()
+    }
 }
 
 impl io::Seek for File {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        match pos {
-            io::SeekFrom::Start(offset) => {
-                self.seek_pos = offset as u32;
-            }
-            io::SeekFrom::Current(offset) => {
-                let target = (self.seek_pos as i64).saturating_add(offset);
-                if target < 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Seek target cannot be negative",
-                    ));
-                }
-                self.seek_pos = target as u32;
-            }
-            io::SeekFrom::End(offset) => {
-                let target = self.dirent.file_size() as i64 + offset;
-                if target < 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Seek target cannot be negative",
-                    ));
-                }
-                self.seek_pos = target as u32;
-            }
+        let target: i64 = match pos {
+            io::SeekFrom::Start(offset) => offset as i64,
+            io::SeekFrom::Current(offset) => (self.seek_pos as i64).saturating_add(offset),
+            io::SeekFrom::End(offset) => self.dirent.file_size() as i64 + offset,
+        };
+
+        if target < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Seek target cannot be negative",
+            ));
         }
+
+        // A file's size is a 32 bit field, so a position past that is one no
+        // file could ever reach. Refusing it here keeps it from being truncated
+        // into a valid position and writing over the start of the file.
+        if target > u32::MAX as i64 {
+            return Err(Error::FileTooLarge.into());
+        }
+
+        self.seek_pos = target as u32;
         Ok(self.seek_pos as u64)
     }
 }
@@ -71,34 +151,13 @@ impl io::Read for File {
 
         while buf_pos < buf.len() as u64 {
             // Ensure we don't read past EOF
-            let bytes_remaining_in_file: u32 = file_size - self.seek_pos;
-            if bytes_remaining_in_file == 0 {
+            if self.seek_pos >= file_size {
                 break;
             }
+            let bytes_remaining_in_file: u32 = file_size - self.seek_pos;
 
             // Map current file position to cluster number
-            let cluster = {
-                let tar_cluster_relative = (self.seek_pos as u64 / fs.num_bytes_per_cluster) as u32;
-
-                // Check if we need to begin scanning from start of cluster chain
-                if tar_cluster_relative < self.cur_cluster_relative {
-                    self.cur_cluster_relative = 0;
-                    self.cur_cluster_absolute = self.dirent.first_cluster();
-                }
-
-                // Scan through the cluster chain
-                for _ in self.cur_cluster_relative..tar_cluster_relative {
-                    let variant = fs.variant;
-                    self.cur_cluster_absolute =
-                        match fs.fat.entry(self.cur_cluster_absolute, variant)? {
-                            FatEntry::Data(cluster) => cluster,
-                            _ => return Err(io::Error::other("Corrupt FAT chain")),
-                        };
-                }
-                self.cur_cluster_relative = tar_cluster_relative;
-
-                self.cur_cluster_absolute
-            };
+            let cluster = self.cluster_at_seek_pos(&mut fs, false)?;
 
             // Determine number of bytes to read in this cluster
             let byte_offset_in_cluster = self.seek_pos as u64 % fs.num_bytes_per_cluster;
@@ -119,8 +178,15 @@ impl io::Read for File {
             let bytes_read = {
                 let start = buf_pos as usize;
                 let end = start + bytes_to_read_from_cluster as usize;
-                fs.device_handle.read(&mut buf[start..end])?
+                io::Read::read(&mut fs.device_handle, &mut buf[start..end])?
             };
+
+            // The entry can claim more bytes than the device actually holds, on
+            // a truncated image or with a size given by hand. Stopping on a
+            // read that returns nothing keeps that from spinning forever.
+            if bytes_read == 0 {
+                break;
+            }
 
             // Advance
             buf_pos += bytes_read as u64;
@@ -128,5 +194,80 @@ impl io::Read for File {
         }
 
         Ok(buf_pos as usize)
+    }
+}
+
+impl io::Write for File {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Get handle to filesystem interface
+        let handle = self.handle.fs.clone();
+        let mut fs = handle.lock().unwrap();
+        fs.ensure_writable()?;
+
+        // A file needs a chain of its own before anything can go into it.
+        let first_cluster = fs.ensure_first_cluster(&mut self.dirent)?;
+        if self.cur_cluster_absolute == 0 {
+            self.cur_cluster_absolute = first_cluster;
+            self.cur_cluster_relative = 0;
+        }
+
+        // File sizes are a 32 bit field, so a write that would carry the
+        // position past that is cut short rather than wrapping.
+        let room = (u32::MAX - self.seek_pos) as usize;
+        if room == 0 {
+            return Err(Error::FileTooLarge.into());
+        }
+        let buf = &buf[..min(buf.len(), room)];
+
+        // Writing past the end of the file leaves a gap, which FATX has no way
+        // to express: it has to be backed by real clusters full of zeroes
+        // before the new bytes go down after it.
+        if self.seek_pos as u64 > self.dirent.file_size() as u64 {
+            let target = self.seek_pos as u64;
+            self.extend_to(&mut fs, target)?;
+        }
+
+        let mut buf_pos: usize = 0;
+        while buf_pos < buf.len() {
+            // Map current file position to cluster number, extending the chain
+            // when the write runs past the last cluster of the file.
+            let cluster = self.cluster_at_seek_pos(&mut fs, true)?;
+
+            // Determine number of bytes to write in this cluster
+            let byte_offset_in_cluster = self.seek_pos as u64 % fs.num_bytes_per_cluster;
+            let bytes_remaining_in_cluster = fs.num_bytes_per_cluster - byte_offset_in_cluster;
+            let bytes_to_write = min(bytes_remaining_in_cluster, (buf.len() - buf_pos) as u64);
+
+            log::debug!("Writing {bytes_to_write} bytes to cluster {cluster}");
+            fs.seek_cluster(cluster, byte_offset_in_cluster)?;
+            let bytes_written = {
+                let start = buf_pos;
+                let end = start + bytes_to_write as usize;
+                io::Write::write(&mut fs.device_handle, &buf[start..end])?
+            };
+            if bytes_written == 0 {
+                break;
+            }
+
+            // Advance
+            buf_pos += bytes_written;
+            self.seek_pos += bytes_written as u32;
+
+            // The file has grown if the write went past its old end.
+            if self.seek_pos > self.dirent.file_size() {
+                self.dirent.set_file_size(self.seek_pos);
+            }
+        }
+
+        self.commit(&mut fs)?;
+
+        Ok(buf_pos)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let handle = self.handle.fs.clone();
+        let mut fs = handle.lock().unwrap();
+        fs.sync()?;
+        Ok(())
     }
 }

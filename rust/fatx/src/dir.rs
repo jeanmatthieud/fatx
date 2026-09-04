@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Component, Path};
 
 use crate::variant::Variant;
@@ -5,19 +6,22 @@ use crate::variant::Variant;
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::*;
 
-const FATX_MAX_FILENAME_LEN: usize = 42;
+pub const FATX_MAX_FILENAME_LEN: usize = 42;
 
 // Markers used in the filename_size field of the directory entry.
 const FATX_DELETED_FILE_MARKER: u8 = 0xe5;
 const FATX_END_OF_DIR_MARKER: u8 = 0xff;
 const FATX_END_OF_DIR_MARKER2: u8 = 0x00;
 
+// Byte the unused tail of a filename is padded with, matching libfatx.
+const FATX_FILENAME_PADDING: u8 = 0xff;
+
 // Mask to be applied when reading directory entry attributes.
 const FATX_ATTR_READ_ONLY: u8 = 1 << 0;
 const FATX_ATTR_SYSTEM: u8 = 1 << 1;
 const FATX_ATTR_HIDDEN: u8 = 1 << 2;
 const FATX_ATTR_VOLUME: u8 = 1 << 3;
-const FATX_ATTR_DIRECTORY: u8 = 1 << 4;
+pub(crate) const FATX_ATTR_DIRECTORY: u8 = 1 << 4;
 
 use crate::datetime::DateTime;
 use crate::error::Error;
@@ -25,8 +29,26 @@ use crate::fat::{ClusterId, FatEntry};
 use crate::fs::{FatxFs, FatxFsHandle};
 use crate::path::normalize_virtual_path;
 
+/// Where a directory entry lives on disk.
+///
+/// An entry has to be found again to be updated — its size after a write, its
+/// name after a rename, its deletion marker after an unlink — and a directory
+/// is a cluster chain rather than a flat array, so the cluster has to be
+/// remembered alongside the index of the entry within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntryLocation {
+    pub(crate) cluster: ClusterId,
+    pub(crate) index: u64,
+}
+
+impl EntryLocation {
+    fn byte_offset_in_cluster(&self) -> u64 {
+        self.index * std::mem::size_of::<DirectoryEntry>() as u64
+    }
+}
+
 // The directory entry, as it appears on disk.
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Debug)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Debug, Clone)]
 #[repr(C, packed)]
 pub struct DirectoryEntry {
     filename_len: u8,
@@ -51,6 +73,18 @@ pub enum DirectoryEntryKind {
 
 impl DirectoryEntry {
     pub(crate) fn from_path<P: AsRef<Path>>(fs: &mut FatxFs, path: P) -> Result<Self, Error> {
+        Ok(Self::lookup(fs, path)?.0)
+    }
+
+    /// Resolve a path to its directory entry and the place that entry occupies
+    /// on disk.
+    ///
+    /// The root directory has no entry of its own — it is described by the
+    /// superblock — so a synthetic entry is returned for it, with no location.
+    pub(crate) fn lookup<P: AsRef<Path>>(
+        fs: &mut FatxFs,
+        path: P,
+    ) -> Result<(Self, Option<EntryLocation>), Error> {
         let path = normalize_virtual_path(path);
         let num_components = path.components().count();
 
@@ -84,7 +118,8 @@ impl DirectoryEntry {
                                 continue;
                             }
                             if comp_idx == (num_components - 1) {
-                                return Ok(dirent);
+                                let location = dir_iter.location();
+                                return Ok((dirent, Some(location)));
                             }
                             if dirent.is_directory() {
                                 break Some(dirent.first_cluster.into());
@@ -100,23 +135,57 @@ impl DirectoryEntry {
         }
 
         // Create a fake DirectoryEntry to represent the root directory
-        Ok(Self {
-            filename_len: 8,
-            attributes: FATX_ATTR_DIRECTORY,
-            filename_bytes: {
-                let mut filename_bytes = [0u8; FATX_MAX_FILENAME_LEN];
-                filename_bytes[0..4].copy_from_slice(b"root");
-                filename_bytes
+        Ok((
+            Self {
+                filename_len: 8,
+                attributes: FATX_ATTR_DIRECTORY,
+                filename_bytes: {
+                    let mut filename_bytes = [0u8; FATX_MAX_FILENAME_LEN];
+                    filename_bytes[0..4].copy_from_slice(b"root");
+                    filename_bytes
+                },
+                first_cluster: fs.root_cluster.into(),
+                file_size: 0.into(),
+                modified_date: 0.into(),
+                modified_time: 0.into(),
+                created_time: 0.into(),
+                created_date: 0.into(),
+                accessed_time: 0.into(),
+                accessed_date: 0.into(),
             },
-            first_cluster: fs.root_cluster.into(),
+            None,
+        ))
+    }
+
+    /// Build a brand new entry for a file or directory.
+    ///
+    /// The unused tail of the filename is padded rather than zeroed, so that
+    /// the bytes written match what the consoles and libfatx write.
+    pub(crate) fn new_node(
+        name: &str,
+        attributes: u8,
+        first_cluster: ClusterId,
+        timestamp: &DateTime,
+        variant: Variant,
+    ) -> Result<Self, Error> {
+        let mut entry = Self {
+            filename_len: 0,
+            attributes,
+            filename_bytes: [FATX_FILENAME_PADDING; FATX_MAX_FILENAME_LEN],
+            first_cluster: first_cluster.into(),
             file_size: 0.into(),
-            modified_date: 0.into(),
             modified_time: 0.into(),
+            modified_date: 0.into(),
             created_time: 0.into(),
             created_date: 0.into(),
             accessed_time: 0.into(),
             accessed_date: 0.into(),
-        })
+        };
+        entry.set_file_name(name)?;
+        entry.set_created(timestamp, variant);
+        entry.set_modified(timestamp, variant);
+        entry.set_accessed(timestamp, variant);
+        Ok(entry)
     }
 
     pub(crate) fn kind(&self) -> DirectoryEntryKind {
@@ -134,8 +203,32 @@ impl DirectoryEntry {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Rename this entry.
+    ///
+    /// A name has to be non-empty, short enough to fit the fixed field, and
+    /// must not collide with either of the markers that the length byte doubles
+    /// as: a 42 byte name is representable but 0xe5 and 0xff are not lengths.
+    pub(crate) fn set_file_name(&mut self, name: &str) -> Result<(), Error> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > FATX_MAX_FILENAME_LEN {
+            return Err(Error::InvalidFileName);
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(Error::InvalidFileName);
+        }
+
+        self.filename_len = bytes.len() as u8;
+        self.filename_bytes = [FATX_FILENAME_PADDING; FATX_MAX_FILENAME_LEN];
+        self.filename_bytes[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
     pub fn file_size(&self) -> u32 {
         self.file_size.into()
+    }
+
+    pub(crate) fn set_file_size(&mut self, size: u32) {
+        self.file_size = size.into();
     }
 
     pub fn is_directory(&self) -> bool {
@@ -182,8 +275,35 @@ impl DirectoryEntry {
         )
     }
 
+    /// Timestamps are held packed, in the encoding of the filesystem they came
+    /// from or are going to: the two variants disagree on the epoch and on the
+    /// width of the hour and minute fields, so a packed timestamp only means
+    /// anything alongside its variant. Only the byte order and the order of the
+    /// two halves are left to `denormalize` on the way out to disk.
+    pub(crate) fn set_created(&mut self, timestamp: &DateTime, variant: Variant) {
+        let (date, time) = timestamp.to_fatx_encoding(variant);
+        self.created_date = date.into();
+        self.created_time = time.into();
+    }
+
+    pub(crate) fn set_modified(&mut self, timestamp: &DateTime, variant: Variant) {
+        let (date, time) = timestamp.to_fatx_encoding(variant);
+        self.modified_date = date.into();
+        self.modified_time = time.into();
+    }
+
+    pub(crate) fn set_accessed(&mut self, timestamp: &DateTime, variant: Variant) {
+        let (date, time) = timestamp.to_fatx_encoding(variant);
+        self.accessed_date = date.into();
+        self.accessed_time = time.into();
+    }
+
     pub(crate) fn first_cluster(&self) -> ClusterId {
         self.first_cluster.into()
+    }
+
+    pub(crate) fn set_first_cluster(&mut self, cluster: ClusterId) {
+        self.first_cluster = cluster.into();
     }
 
     /// Convert this entry from on-disk form into the canonical little-endian,
@@ -214,6 +334,121 @@ impl DirectoryEntry {
         swap_pair(&mut self.created_time, &mut self.created_date);
         swap_pair(&mut self.accessed_time, &mut self.accessed_date);
     }
+
+    /// Convert this entry from the canonical form back into on-disk form.
+    ///
+    /// Swapping a pair of fields and swapping their bytes are both their own
+    /// inverse, so this is the same operation as `normalize`; it exists under
+    /// its own name so that call sites say which way they are converting.
+    pub(crate) fn denormalize(&mut self, variant: Variant) {
+        self.normalize(variant);
+    }
+
+    /// Write this entry over the one at `location`.
+    pub(crate) fn write_at(&self, fs: &mut FatxFs, location: EntryLocation) -> Result<(), Error> {
+        let mut raw = self.clone();
+        raw.denormalize(fs.variant);
+
+        fs.seek_cluster(location.cluster, location.byte_offset_in_cluster())?;
+        fs.device_handle.write_all(raw.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// Overwrite just the length byte of an entry, turning it into a marker.
+///
+/// Only that one byte distinguishes a live entry from a deleted one or from
+/// the end of the directory, so the rest of the entry is left untouched.
+pub(crate) fn set_entry_marker(
+    fs: &mut FatxFs,
+    location: EntryLocation,
+    marker: u8,
+) -> Result<(), Error> {
+    fs.seek_cluster(location.cluster, location.byte_offset_in_cluster())?;
+    fs.device_handle.write_all(&[marker])?;
+    Ok(())
+}
+
+pub(crate) fn mark_entry_deleted(fs: &mut FatxFs, location: EntryLocation) -> Result<(), Error> {
+    set_entry_marker(fs, location, FATX_DELETED_FILE_MARKER)
+}
+
+pub(crate) fn mark_end_of_directory(fs: &mut FatxFs, location: EntryLocation) -> Result<(), Error> {
+    set_entry_marker(fs, location, FATX_END_OF_DIR_MARKER)
+}
+
+/// Find a place in a directory for a new entry.
+///
+/// A deleted entry is reused if there is one. Otherwise the entry that marks
+/// the end of the directory is taken over, and the marker is pushed one slot
+/// along — into a freshly allocated cluster if the directory has run out of
+/// room in this one.
+pub(crate) fn alloc_entry(fs: &mut FatxFs, dir_cluster: ClusterId) -> Result<EntryLocation, Error> {
+    let entries_per_cluster = fs.num_entries_per_cluster;
+    let mut iter = DirectoryEntryIterator::new(dir_cluster);
+
+    while let Some(entry) = iter.next(fs) {
+        let entry = entry?;
+        let location = iter.location();
+        match entry.kind() {
+            DirectoryEntryKind::Deleted => return Ok(location),
+            DirectoryEntryKind::EndOfDirectory => {
+                // Take this slot and push the end marker one along.
+                if location.index + 1 < entries_per_cluster {
+                    mark_end_of_directory(
+                        fs,
+                        EntryLocation {
+                            cluster: location.cluster,
+                            index: location.index + 1,
+                        },
+                    )?;
+                } else {
+                    let next = next_directory_cluster(fs, location.cluster)?;
+                    mark_end_of_directory(
+                        fs,
+                        EntryLocation {
+                            cluster: next,
+                            index: 0,
+                        },
+                    )?;
+                }
+                return Ok(location);
+            }
+            DirectoryEntryKind::Valid => continue,
+        }
+    }
+
+    // Every slot of every cluster of this directory is occupied and the chain
+    // ended without an end-of-directory marker. Carry on into a new cluster.
+    let cluster = fs.alloc_cluster(true)?;
+    fs.attach_cluster(iter.cluster, cluster)?;
+    mark_end_of_directory(fs, EntryLocation { cluster, index: 1 })?;
+    Ok(EntryLocation { cluster, index: 0 })
+}
+
+/// The cluster following `cluster` in a directory chain, extending the chain if
+/// it ends there.
+fn next_directory_cluster(fs: &mut FatxFs, cluster: ClusterId) -> Result<ClusterId, Error> {
+    if let Some(next) = fs.next_cluster(cluster)? {
+        return Ok(next);
+    }
+
+    let next = fs.alloc_cluster(true)?;
+    fs.attach_cluster(cluster, next)?;
+    Ok(next)
+}
+
+/// Whether a directory holds no live entries.
+pub(crate) fn directory_is_empty(fs: &mut FatxFs, dir_cluster: ClusterId) -> Result<bool, Error> {
+    let mut iter = DirectoryEntryIterator::new(dir_cluster);
+    while let Some(entry) = iter.next(fs) {
+        match entry?.kind() {
+            DirectoryEntryKind::Valid => return Ok(false),
+            DirectoryEntryKind::Deleted => continue,
+            DirectoryEntryKind::EndOfDirectory => break,
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) struct DirectoryEntryIterator {
@@ -228,6 +463,15 @@ impl DirectoryEntryIterator {
             cluster,
             entry: -1,
             finished: false,
+        }
+    }
+
+    /// Where the entry just returned by `next` lives on disk.
+    pub(crate) fn location(&self) -> EntryLocation {
+        debug_assert!(self.entry >= 0, "no entry has been read yet");
+        EntryLocation {
+            cluster: self.cluster,
+            index: self.entry as u64,
         }
     }
 
@@ -249,6 +493,13 @@ impl DirectoryEntryIterator {
                 Ok(FatEntry::Data(next_cluster)) => {
                     self.cluster = next_cluster as ClusterId;
                     self.entry = 0;
+                }
+                Ok(FatEntry::End) => {
+                    // The directory has no more clusters. Callers looking to
+                    // extend it need to know where the chain ended, which is
+                    // the cluster this iterator is still sitting on.
+                    self.finished = true;
+                    return None;
                 }
                 _ => {
                     self.finished = true;

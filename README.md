@@ -18,6 +18,9 @@ This adds full read/write support for the Xbox 360's FATX filesystem to libfatx,
 
 The write path has been verified end-to-end against real Xbox 360 hardware.
 
+The Rust crate supports writing as well, for both flavours: `fatx-fuse` mounts
+read-only unless given `--read-write`.
+
 License
 -------
 See LICENSE.txt
