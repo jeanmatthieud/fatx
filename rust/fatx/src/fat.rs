@@ -80,6 +80,9 @@ impl FatEntry {
 #[derive(Debug)]
 pub(crate) struct Fat {
     fat_type: FatType,
+    /// How many entries the FAT actually describes. The cache is rounded up to
+    /// a whole number of blocks, so it is longer than that.
+    num_entries: u32,
     pub(crate) fat_size_bytes: u64,
     pub(crate) fat_data: Vec<u8>, // FIXME: Smarter cache
     /// Half-open byte range of `fat_data` modified since the last flush.
@@ -105,10 +108,25 @@ impl Fat {
 
         Self {
             fat_type,
+            num_entries: num_fat_entries,
             fat_size_bytes,
             fat_data,
             dirty: None,
         }
+    }
+
+    /// Refuse a cluster number the FAT has no entry for.
+    ///
+    /// A cluster number read out of a directory entry is whatever the on-disk
+    /// bytes say, so a corrupt or hand-made entry can point anywhere; without
+    /// this the cache would simply be indexed out of bounds and the driver
+    /// would panic.
+    fn check_index(&self, index: FatEntryId) -> Result<(), Error> {
+        if index >= self.num_entries {
+            log::error!("Cluster {index} is outside the FAT");
+            return Err(Error::InvalidClusterNumber);
+        }
+        Ok(())
     }
 
     /// The width, in bytes, of one entry of this FAT.
@@ -124,6 +142,7 @@ impl Fat {
     /// The cached FAT is held in on-disk byte order, so entries are swapped
     /// here as they are read out rather than when the cache is filled.
     pub(crate) fn entry(&mut self, index: FatEntryId, variant: Variant) -> Result<FatEntry, Error> {
+        self.check_index(index)?;
         let swap = variant.needs_swap();
         match self.fat_type {
             FatType::Type16 => {
@@ -159,6 +178,7 @@ impl Fat {
         entry: FatEntry,
         variant: Variant,
     ) -> Result<(), Error> {
+        self.check_index(index)?;
         let swap = variant.needs_swap();
         let raw = entry.to_raw()?;
         let offset = index as usize * self.entry_size();

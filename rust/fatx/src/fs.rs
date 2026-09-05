@@ -549,9 +549,12 @@ impl FatxFs {
         attributes: u8,
         cluster: ClusterId,
     ) -> Result<(DirectoryEntry, EntryLocation), Error> {
-        let location = dir::alloc_entry(self, parent_cluster)?;
+        // Building the entry first is what rejects a name the filesystem cannot
+        // hold. Claiming a slot before that can grow the parent directory by a
+        // cluster, which nothing would give back once the name is refused.
         let entry =
             DirectoryEntry::new_node(name, attributes, cluster, &DateTime::now(), self.variant)?;
+        let location = dir::alloc_entry(self, parent_cluster)?;
         entry.write_at(self, location)?;
         Ok((entry, location))
     }
@@ -606,11 +609,14 @@ impl FatxFs {
         if !dirent.is_directory() {
             return Err(Error::NotADirectory);
         }
-        if !dir::directory_is_empty(self, dirent.first_cluster())? {
-            return Err(Error::DirectoryNotEmpty);
-        }
 
+        // As with a file, a directory written by another tool may own no
+        // cluster at all. It holds nothing, so there is neither a chain to walk
+        // looking for entries nor one to give back.
         if dirent.first_cluster() != 0 {
+            if !dir::directory_is_empty(self, dirent.first_cluster())? {
+                return Err(Error::DirectoryNotEmpty);
+            }
             self.free_cluster_chain(dirent.first_cluster())?;
         }
         dir::mark_entry_deleted(self, location)?;
@@ -633,40 +639,7 @@ impl FatxFs {
         let old_size = dirent.file_size() as u64;
         let first_cluster = self.ensure_first_cluster(&mut dirent)?;
 
-        // A file keeps at least its first cluster, so that its entry always
-        // points at a real chain.
-        let wanted = size.div_ceil(self.num_bytes_per_cluster).max(1);
-
-        // Walk the chain, extending it if it is short of what is wanted.
-        let mut cluster = first_cluster;
-        for _ in 1..wanted {
-            cluster = match self.next_cluster(cluster)? {
-                Some(next) => next,
-                None => {
-                    let next = self.alloc_cluster(true)?;
-                    self.attach_cluster(cluster, next)?;
-                    next
-                }
-            };
-        }
-
-        // Anything past that is no longer part of the file.
-        if let Some(next) = self.next_cluster(cluster)? {
-            self.free_cluster_chain(next)?;
-            self.fat.set_entry(cluster, FatEntry::End, self.variant)?;
-        }
-
-        // Bytes between the old end of the file and the new one must read as
-        // zero.
-        // Clusters added above were allocated zeroed, and so was any cluster
-        // reused from the free pool, so only the cluster the file used to end
-        // in can still be holding bytes that are now part of it.
-        if size > old_size {
-            let tail_cluster = self.cluster_for_offset(first_cluster, old_size, false)?;
-            let tail_offset = old_size % self.num_bytes_per_cluster;
-            let len = (self.num_bytes_per_cluster - tail_offset).min(size - old_size);
-            self.zero_range(tail_cluster, tail_offset, len)?;
-        }
+        self.resize_chain(first_cluster, old_size, size)?;
 
         dirent.set_file_size(size as u32);
         dirent.set_modified(&DateTime::now(), self.variant);
@@ -698,13 +671,10 @@ impl FatxFs {
         let (to_parent_cluster, to_name) = self.split_parent(&to)?;
         dirent.set_file_name(&to_name)?;
 
-        // Claim a slot for the new entry before touching anything else. The
-        // claim is what can run the filesystem out of space, and doing it
-        // first means a full disk leaves both ends of the rename intact rather
-        // than taking the destination away and then failing.
-        let to_location = dir::alloc_entry(self, to_parent_cluster)?;
-
         // Replace whatever is already at the destination, as rename(2) does.
+        // Removing it first frees its slot, which is then the one the new entry
+        // is written into: claiming a slot beforehand would leave that one
+        // deleted and grow the directory by an entry on every rename.
         match DirectoryEntry::lookup(self, &to) {
             Ok((existing, _)) => {
                 if existing.is_directory() {
@@ -716,6 +686,8 @@ impl FatxFs {
             Err(Error::NotFound) => {}
             Err(err) => return Err(err),
         }
+
+        let to_location = dir::alloc_entry(self, to_parent_cluster)?;
 
         dirent.write_at(self, to_location)?;
 
@@ -763,6 +735,68 @@ impl FatxFs {
         let cluster = self.alloc_cluster(true)?;
         dirent.set_first_cluster(cluster);
         Ok(cluster)
+    }
+
+    /// Cut a chain down to `clusters` clusters, giving the rest back.
+    ///
+    /// A chain already that short is left alone.
+    pub(crate) fn trim_cluster_chain(
+        &mut self,
+        first_cluster: ClusterId,
+        clusters: u64,
+    ) -> Result<(), Error> {
+        let mut cluster = first_cluster;
+        for _ in 1..clusters {
+            cluster = match self.next_cluster(cluster)? {
+                Some(next) => next,
+                None => return Ok(()),
+            };
+        }
+
+        if let Some(next) = self.next_cluster(cluster)? {
+            self.free_cluster_chain(next)?;
+            self.fat.set_entry(cluster, FatEntry::End, self.variant)?;
+        }
+
+        Ok(())
+    }
+
+    /// Give a chain exactly the clusters a file of `new_size` bytes needs, with
+    /// every byte between `old_size` and `new_size` reading as zero.
+    ///
+    /// A chain can hold more clusters than the size in the entry accounts for:
+    /// a file written by another tool, or one whose write ran out of space
+    /// before the entry could be updated. Those clusters are not part of the
+    /// file and may be holding anything, so they are given back before it grows
+    /// rather than reappearing inside it. What takes their place comes from
+    /// `alloc_cluster`, which hands clusters out zeroed, leaving only the
+    /// cluster the file used to end in to be cleared here.
+    pub(crate) fn resize_chain(
+        &mut self,
+        first_cluster: ClusterId,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<(), Error> {
+        // A file keeps at least its first cluster, so that its entry always
+        // points at a real chain.
+        let wanted = new_size.div_ceil(self.num_bytes_per_cluster).max(1);
+        let owned = old_size.div_ceil(self.num_bytes_per_cluster).max(1);
+
+        self.trim_cluster_chain(first_cluster, wanted.min(owned))?;
+
+        if wanted > owned {
+            // Walking to the last byte allocates every cluster the size needs.
+            self.cluster_for_offset(first_cluster, new_size - 1, true)?;
+        }
+
+        if new_size > old_size {
+            let tail_cluster = self.cluster_for_offset(first_cluster, old_size, false)?;
+            let tail_offset = old_size % self.num_bytes_per_cluster;
+            let len = (self.num_bytes_per_cluster - tail_offset).min(new_size - old_size);
+            self.zero_range(tail_cluster, tail_offset, len)?;
+        }
+
+        Ok(())
     }
 
     /// Walk a cluster chain to the cluster holding a byte offset.

@@ -122,6 +122,14 @@ fn read_file(fs: &mut FatxFsHandle, path: &str) -> Vec<u8> {
     out
 }
 
+/// Read an open file, so that a read error can be looked at rather than
+/// unwrapped.
+fn read_file_raw(file: &mut fatx::File) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 fn listing(fs: &mut FatxFsHandle, path: &str) -> Vec<String> {
     let mut names: Vec<String> = fs
         .read_dir(path)
@@ -567,7 +575,11 @@ fn free_space_follows_what_the_clusters_are_doing() {
 
         // Two clusters of payload cost two clusters, however few bytes of the
         // second one are actually used.
-        write_file(&mut fs, "/BIG.BIN", &vec![0x11u8; BYTES_PER_CLUSTER as usize + 1]);
+        write_file(
+            &mut fs,
+            "/BIG.BIN",
+            &vec![0x11u8; BYTES_PER_CLUSTER as usize + 1],
+        );
         let filled = fs.space().unwrap();
         assert_eq!(filled.used_bytes(), 2 * BYTES_PER_CLUSTER);
         assert_eq!(filled.total_bytes, empty.total_bytes);
@@ -575,5 +587,146 @@ fn free_space_follows_what_the_clusters_are_doing() {
         // And they come back when it goes away.
         fs.unlink("/BIG.BIN").unwrap();
         assert_eq!(fs.space().unwrap(), empty);
+    }
+}
+
+#[test]
+fn a_write_that_runs_out_of_room_keeps_what_it_managed_to_write() {
+    for variant in both_variants() {
+        let image = Image::new("shortwrite", variant);
+        let mut fs = image.open(variant, true);
+
+        // Fill the filesystem up to its last four clusters: one for the file
+        // that is about to be created, three for the rest of its payload.
+        let free = fs.space().unwrap().free_bytes;
+        let fill = free - 4 * BYTES_PER_CLUSTER;
+        write_file(&mut fs, "/FILL.BIN", &vec![0x11u8; fill as usize]);
+        assert_eq!(fs.space().unwrap().free_bytes, 4 * BYTES_PER_CLUSTER);
+
+        let mut file = fs.create("/OVER.BIN").unwrap();
+        let payload = vec![0x22u8; 10 * BYTES_PER_CLUSTER as usize];
+        let written = file.write(&payload).unwrap();
+        drop(file);
+
+        // The bytes that fitted are on the device, so the file has to account
+        // for them: reporting the whole write as a failure would leave them
+        // inside the chain and outside the file.
+        assert_eq!(written, 4 * BYTES_PER_CLUSTER as usize);
+        assert_eq!(fs.stat("/OVER.BIN").unwrap().file_size() as usize, written);
+
+        let back = read_file(&mut fs, "/OVER.BIN");
+        assert_eq!(back.len(), written);
+        assert!(back.iter().all(|&b| b == 0x22));
+
+        // And the next write, with nothing left to write into, does fail.
+        let mut file = fs.open("/OVER.BIN").unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        assert!(file.write(&[0x33u8; 16]).is_err());
+    }
+}
+
+#[test]
+fn growing_a_file_does_not_hand_back_bytes_it_no_longer_owns() {
+    for variant in both_variants() {
+        let image = Image::new("stalechain", variant);
+        let mut fs = image.open(variant, true);
+        write_file(
+            &mut fs,
+            "/STALE.BIN",
+            &vec![0xaau8; 3 * BYTES_PER_CLUSTER as usize],
+        );
+        drop(fs);
+
+        // Shrink the size in the entry by hand, leaving the chain as long as it
+        // was. Everything past the hundredth byte now belongs to no file, which
+        // is also the state a write that ran out of room used to leave behind.
+        let size_field = cluster_at(ROOT_CLUSTER) as usize + 48;
+        let mut bytes = image.bytes();
+        bytes[size_field..size_field + 4].copy_from_slice(&to_disk_u32(100, variant));
+        std::fs::write(&image.path, &bytes).unwrap();
+
+        let mut fs = image.open(variant, true);
+        assert_eq!(fs.stat("/STALE.BIN").unwrap().file_size(), 100);
+
+        fs.truncate("/STALE.BIN", 3 * BYTES_PER_CLUSTER).unwrap();
+        let back = read_file(&mut fs, "/STALE.BIN");
+        assert_eq!(back.len(), 3 * BYTES_PER_CLUSTER as usize);
+        assert!(
+            back[..100].iter().all(|&b| b == 0xaa),
+            "the file itself is untouched"
+        );
+        assert!(
+            back[100..].iter().all(|&b| b == 0),
+            "bytes the file did not own must read as zero, not as what was there"
+        );
+    }
+}
+
+#[test]
+fn a_directory_that_owns_no_cluster_can_still_be_removed() {
+    for variant in both_variants() {
+        let image = Image::new("noclusterdir", variant);
+        let mut fs = image.open(variant, true);
+        fs.mkdir("/DIR").unwrap();
+        drop(fs);
+
+        // A directory pointing at no cluster holds nothing, so there is neither
+        // a chain to walk looking for entries nor one to give back.
+        let first_cluster_field = cluster_at(ROOT_CLUSTER) as usize + 44;
+        let mut bytes = image.bytes();
+        bytes[first_cluster_field..first_cluster_field + 4].fill(0);
+        std::fs::write(&image.path, &bytes).unwrap();
+
+        let mut fs = image.open(variant, true);
+        fs.rmdir("/DIR").unwrap();
+        assert_eq!(listing(&mut fs, "/"), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn an_entry_pointing_outside_the_fat_is_refused() {
+    for variant in both_variants() {
+        let image = Image::new("wildcluster", variant);
+        let mut fs = image.open(variant, true);
+        write_file(&mut fs, "/WILD.BIN", b"payload");
+        drop(fs);
+
+        // A cluster number out of a directory entry is whatever the disk says,
+        // and one past the end of the FAT used to be indexed straight into the
+        // cache.
+        let first_cluster_field = cluster_at(ROOT_CLUSTER) as usize + 44;
+        let mut bytes = image.bytes();
+        bytes[first_cluster_field..first_cluster_field + 4]
+            .copy_from_slice(&to_disk_u32(0x0010_0000, variant));
+        std::fs::write(&image.path, &bytes).unwrap();
+
+        let mut fs = image.open(variant, true);
+        assert!(fs.unlink("/WILD.BIN").is_err());
+        assert!(fs.truncate("/WILD.BIN", 0).is_err());
+        let mut file = fs.open("/WILD.BIN").unwrap();
+        assert!(read_file_raw(&mut file).is_err());
+    }
+}
+
+#[test]
+fn renaming_onto_the_same_name_does_not_grow_the_directory() {
+    for variant in both_variants() {
+        let image = Image::new("renameslot", variant);
+        let mut fs = image.open(variant, true);
+        write_file(&mut fs, "/B.BIN", b"first");
+        let baseline = fs.space().unwrap();
+
+        // The entry the rename replaces frees a slot, and that is the slot the
+        // new entry belongs in. Taking a fresh one instead would leave a
+        // deleted entry behind each time and push the directory into a second
+        // cluster once its first one is used up.
+        for _ in 0..ENTRIES_PER_CLUSTER + 4 {
+            write_file(&mut fs, "/A.BIN", b"payload");
+            fs.rename("/A.BIN", "/B.BIN").unwrap();
+        }
+
+        assert_eq!(listing(&mut fs, "/"), vec![String::from("B.BIN")]);
+        assert_eq!(read_file(&mut fs, "/B.BIN"), b"payload");
+        assert_eq!(fs.space().unwrap(), baseline);
     }
 }

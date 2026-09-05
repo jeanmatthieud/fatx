@@ -86,16 +86,12 @@ impl File {
         }
 
         let first_cluster = self.dirent.first_cluster();
+        fs.resize_chain(first_cluster, old_size, new_size)?;
 
-        // Walking to the last byte allocates every cluster the new size needs.
-        fs.cluster_for_offset(first_cluster, new_size - 1, true)?;
-
-        // Those clusters are handed out zeroed, so all that is left is the
-        // unused tail of the cluster the file used to end in.
-        let tail_cluster = fs.cluster_for_offset(first_cluster, old_size, false)?;
-        let tail_offset = old_size % fs.num_bytes_per_cluster;
-        let len = (fs.num_bytes_per_cluster - tail_offset).min(new_size - old_size);
-        fs.zero_range(tail_cluster, tail_offset, len)?;
+        // Resizing may have dropped clusters past the end of the file, so the
+        // walk this handle left off at cannot be trusted any more.
+        self.cur_cluster_relative = 0;
+        self.cur_cluster_absolute = first_cluster;
 
         self.dirent.set_file_size(new_size as u32);
         Ok(())
@@ -228,10 +224,21 @@ impl io::Write for File {
         }
 
         let mut buf_pos: usize = 0;
+        let mut error = None;
         while buf_pos < buf.len() {
             // Map current file position to cluster number, extending the chain
             // when the write runs past the last cluster of the file.
-            let cluster = self.cluster_at_seek_pos(&mut fs, true)?;
+            //
+            // Running out of room here ends the write rather than failing it:
+            // what has already gone down is on the device, and reporting a
+            // failure would leave those bytes outside the file for good.
+            let cluster = match self.cluster_at_seek_pos(&mut fs, true) {
+                Ok(cluster) => cluster,
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            };
 
             // Determine number of bytes to write in this cluster
             let byte_offset_in_cluster = self.seek_pos as u64 % fs.num_bytes_per_cluster;
@@ -239,11 +246,19 @@ impl io::Write for File {
             let bytes_to_write = min(bytes_remaining_in_cluster, (buf.len() - buf_pos) as u64);
 
             log::debug!("Writing {bytes_to_write} bytes to cluster {cluster}");
-            fs.seek_cluster(cluster, byte_offset_in_cluster)?;
-            let bytes_written = {
-                let start = buf_pos;
-                let end = start + bytes_to_write as usize;
-                io::Write::write(&mut fs.device_handle, &buf[start..end])?
+            let bytes_written = match fs
+                .seek_cluster(cluster, byte_offset_in_cluster)
+                .map_err(io::Error::from)
+                .and_then(|()| {
+                    let start = buf_pos;
+                    let end = start + bytes_to_write as usize;
+                    io::Write::write(&mut fs.device_handle, &buf[start..end])
+                }) {
+                Ok(bytes_written) => bytes_written,
+                Err(err) => {
+                    error = Some(err.into());
+                    break;
+                }
             };
             if bytes_written == 0 {
                 break;
@@ -259,6 +274,14 @@ impl io::Write for File {
             }
         }
 
+        // A short write is still a write: the caller is told how much of the
+        // buffer went down, and only a write that placed nothing at all reports
+        // what stopped it.
+        if buf_pos == 0
+            && let Some(err) = error
+        {
+            return Err(err.into());
+        }
         self.commit(&mut fs)?;
 
         Ok(buf_pos)

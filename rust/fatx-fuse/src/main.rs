@@ -11,10 +11,10 @@ use clap::builder::styling::{AnsiColor, Effects, Style, Styles};
 use fatx::{DirectoryEntry, FatxFs, FatxFsConfig, FatxFsHandle};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{
-    EBUSY, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+    EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EPERM,
     EROFS,
 };
 
@@ -99,7 +99,7 @@ fn errno(err: fatx::Error) -> libc::c_int {
         fatx::Error::NoSpaceLeft => ENOSPC,
         fatx::Error::ReadOnlyFilesystem => EROFS,
         fatx::Error::InvalidFileName => ENAMETOOLONG,
-        fatx::Error::IsRootDirectory => EBUSY,
+        fatx::Error::IsRootDirectory => EPERM,
         fatx::Error::FileTooLarge => EFBIG,
         fatx::Error::InvalidRename => EINVAL,
         fatx::Error::Io(err) => io_errno(err),
@@ -130,7 +130,7 @@ fn io_errno(err: std::io::Error) -> libc::c_int {
         ErrorKind::ReadOnlyFilesystem => EROFS,
         ErrorKind::FileTooLarge => EFBIG,
         ErrorKind::InvalidInput => EINVAL,
-        ErrorKind::PermissionDenied => EBUSY,
+        ErrorKind::PermissionDenied => EPERM,
         _ => EIO,
     }
 }
@@ -574,15 +574,23 @@ impl Filesystem for FuseFatxFs {
             return;
         }
 
-        if (atime.is_some() || mtime.is_some())
-            && let Err(err) = self.fatx.set_times(
+        if atime.is_some() || mtime.is_some() {
+            match self.fatx.set_times(
                 &path,
                 atime.map(time_or_now_to_fatx_datetime),
                 mtime.map(time_or_now_to_fatx_datetime),
-            )
-        {
-            reply.error(errno(err));
-            return;
+            ) {
+                Ok(()) => {}
+                // The root directory has no entry of its own to keep timestamps
+                // in, so there is nothing to write and nothing to report: a
+                // touch on the mount point is quietly accepted, as a change of
+                // ownership or mode is.
+                Err(fatx::Error::IsRootDirectory) => {}
+                Err(err) => {
+                    reply.error(errno(err));
+                    return;
+                }
+            }
         }
 
         match self.reply_with_entry(&path) {
@@ -610,6 +618,35 @@ impl Filesystem for FuseFatxFs {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(errno(err)),
         }
+    }
+
+    /// Report how much of the filesystem is in use, in clusters.
+    ///
+    /// FATX has no count of its free clusters on disk, so the answer comes from
+    /// a walk of the FAT. There is no inode table either, and no bound on how
+    /// many entries the free space could hold, so the file counts are left at
+    /// zero, which is how a filesystem says it does not know.
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let space = match self.fatx.space() {
+            Ok(space) => space,
+            Err(err) => {
+                reply.error(errno(err));
+                return;
+            }
+        };
+
+        let clusters = space.total_bytes / space.bytes_per_cluster;
+        let free = space.free_bytes / space.bytes_per_cluster;
+        reply.statfs(
+            clusters,
+            free,
+            free,
+            0,
+            0,
+            space.bytes_per_cluster as u32,
+            fatx::dir::FATX_MAX_FILENAME_LEN as u32,
+            space.bytes_per_cluster as u32,
+        );
     }
 
     /// Everything written is already on the device by the time the call that
