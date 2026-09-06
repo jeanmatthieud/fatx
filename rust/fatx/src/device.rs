@@ -7,9 +7,12 @@
 //!
 //! Windows is not. A handle on a raw device rejects any access that does not
 //! start on a sector boundary and cover whole sectors, and it cannot report
-//! its length through the ordinary file calls either. This module papers over
-//! both, so the rest of the library keeps asking for the bytes it wants and
-//! stays free of `#[cfg]`.
+//! its length through the ordinary file calls either. macOS splits the two
+//! problems across its two nodes for the same disk: `/dev/diskN` takes any
+//! access but reports no length, `/dev/rdiskN` reports no length and takes
+//! only aligned whole blocks. This module papers over all of it, so the rest
+//! of the library keeps asking for the bytes it wants and stays free of
+//! `#[cfg]`.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -19,7 +22,11 @@ use std::path::Path;
 #[path = "device/windows.rs"]
 mod sys;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[path = "device/macos.rs"]
+mod sys;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[path = "device/unix.rs"]
 mod sys;
 
@@ -40,8 +47,10 @@ pub(crate) struct Device {
     /// The alignment every access to `file` has to satisfy, in bytes.
     ///
     /// One means the platform accepts any offset and any length, which is the
-    /// case for image files everywhere and for block devices outside Windows;
-    /// the bounce buffer is then skipped entirely.
+    /// case for image files everywhere, for block devices outside Windows, and
+    /// for the buffered `/dev/diskN` on macOS; the bounce buffer is then
+    /// skipped entirely. Note that an alignment of one says nothing about the
+    /// length: a macOS block device sets this to one and still supplies `len`.
     sector_size: u64,
     /// Where the *caller* is positioned, which need not be aligned at all.
     pos: u64,
@@ -96,11 +105,11 @@ impl Device {
 
     /// The length of the device in bytes.
     ///
-    /// Seeking to the end is the only thing that answers for every kind of
-    /// object at once: a block device reports a size of zero from `stat`, so
-    /// its metadata cannot be asked, while an image file has no geometry to
-    /// query. Windows, where seeking a device handle answers nothing useful,
-    /// is why the platform layer gets to supply the length instead.
+    /// Seeking to the end is what answers for the objects left to this path: a
+    /// block device reports a size of zero from `stat`, so its metadata cannot
+    /// be asked, while an image file has no geometry to query. Windows and
+    /// macOS, where a device answers neither `stat` nor `lseek(SEEK_END)`, are
+    /// why the platform layer gets to supply the length instead.
     ///
     /// The underlying position is left wherever this leaves it; every read and
     /// write seeks first, and the caller's own position lives in `pos`.
@@ -112,7 +121,7 @@ impl Device {
     }
 
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        sys::sync(&self.file)
     }
 
     /// Whether accesses have to be aligned, i.e. whether the bounce buffer is

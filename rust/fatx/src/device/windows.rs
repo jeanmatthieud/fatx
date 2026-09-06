@@ -78,6 +78,10 @@ pub(super) fn open(path: &Path, writable: bool) -> io::Result<File> {
     })
 }
 
+pub(super) fn sync(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
 /// Run an ioctl that takes no input and fills `out` with a fixed-size answer.
 fn ioctl(file: &File, code: u32, out: &mut [u8]) -> io::Result<()> {
     let mut returned: u32 = 0;
