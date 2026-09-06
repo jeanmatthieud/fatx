@@ -730,3 +730,31 @@ fn renaming_onto_the_same_name_does_not_grow_the_directory() {
         assert_eq!(fs.space().unwrap(), baseline);
     }
 }
+
+/// A partition described as running to the end of the device has to be sized
+/// against the device itself, which is how the 360 data partition and the
+/// homebrew F partition are described.
+///
+/// An image answers that question from anywhere, so this only proves the path
+/// is wired up; the case that actually bites is a block device, which reports
+/// a size of zero from `stat` and has to be seeked to the end instead. That
+/// one cannot be reached without a real disk.
+#[test]
+fn a_partition_that_runs_to_the_end_is_sized_against_the_device() {
+    let image = Image::new("open-ended", Variant::Xbox);
+
+    let config = FatxFsConfig::new(image.path())
+        .variant(Variant::Xbox)
+        .writable(true)
+        .partition_offset_bytes(0)
+        .partition_size_bytes(u64::MAX);
+    let mut fs = FatxFs::open_device(&config).unwrap();
+
+    // The same filesystem as an explicitly sized open would have found.
+    let open_ended = fs.space().unwrap();
+    let mut sized = image.open(Variant::Xbox, false);
+    assert_eq!(open_ended, sized.space().unwrap());
+
+    write_file(&mut fs, "/HELLO.TXT", b"open ended");
+    assert_eq!(read_file(&mut fs, "/HELLO.TXT"), b"open ended");
+}

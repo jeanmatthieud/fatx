@@ -95,10 +95,19 @@ impl Device {
     }
 
     /// The length of the device in bytes.
-    pub(crate) fn len(&self) -> io::Result<u64> {
+    ///
+    /// Seeking to the end is the only thing that answers for every kind of
+    /// object at once: a block device reports a size of zero from `stat`, so
+    /// its metadata cannot be asked, while an image file has no geometry to
+    /// query. Windows, where seeking a device handle answers nothing useful,
+    /// is why the platform layer gets to supply the length instead.
+    ///
+    /// The underlying position is left wherever this leaves it; every read and
+    /// write seeks first, and the caller's own position lives in `pos`.
+    pub(crate) fn len(&mut self) -> io::Result<u64> {
         match self.len {
             Some(len) => Ok(len),
-            None => Ok(self.file.metadata()?.len()),
+            None => self.file.seek(SeekFrom::End(0)),
         }
     }
 
