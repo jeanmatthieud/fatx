@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::datetime::DateTime;
+use crate::device::Device;
 use crate::dir::{
     self, DirectoryEntry, DirectoryEntryIntoIterator, EntryLocation, FATX_ATTR_DIRECTORY,
 };
@@ -77,7 +78,7 @@ impl Space {
 pub struct FatxFs {
     self_handle: Weak<Mutex<FatxFs>>,
 
-    pub(crate) device_handle: std::fs::File,
+    pub(crate) device_handle: Device,
     pub(crate) variant: Variant,
     pub(crate) writable: bool,
     pub(crate) partition_offset_bytes: u64,
@@ -173,16 +174,13 @@ impl FatxFs {
             return Err(Error::InvalidPartitionOffset);
         }
         // Open device
-        let mut device_handle = std::fs::OpenOptions::new()
-            .read(true)
-            .write(config.writable)
-            .open(&config.device_path)?;
+        let mut device_handle = Device::open(&config.device_path, config.writable)?;
 
         // A size of u64::MAX means "the rest of the device", which is how the
         // partitions that run to the end of the disk are described. Resolve it
         // against the device's actual length, rounded down to a whole sector.
         let partition_size_bytes = if config.partition_size_bytes == u64::MAX {
-            let device_size = device_handle.seek(SeekFrom::End(0))?;
+            let device_size = device_handle.len()?;
             if device_size <= config.partition_offset_bytes {
                 return Err(Error::InvalidPartitionSize);
             }

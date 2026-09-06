@@ -1,4 +1,5 @@
 pub mod datetime;
+mod device;
 pub mod dir;
 pub mod error;
 pub mod fat;
