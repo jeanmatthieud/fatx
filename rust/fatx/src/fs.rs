@@ -226,7 +226,19 @@ impl FatxFs {
 
         // Calculate FAT size
         let fat_offset_bytes = config.partition_offset_bytes + FATX_FAT_OFFSET_BYTES;
-        let num_fat_entries = (partition_size_bytes / num_bytes_per_cluster) as u32;
+        // The reserved entry counts towards the FAT's size, and has to be added
+        // before the entries are widened and the total rounded up to a page --
+        // exactly as `libfatx` does it (see `fatx.c`, `fatx_open_device`).
+        // Rounding hides the difference on most partitions, but not on one
+        // whose entries already fill a whole number of pages: the Xbox 360
+        // compatibility partition is 256 MiB of 16 KiB clusters, i.e. 16384
+        // entries of two bytes, i.e. exactly eight pages, so leaving the
+        // reserved entry out keeps the FAT one page short and moves the whole
+        // cluster area with it. Everything past the FAT then reads a page
+        // early: directories come back empty, and writes land beside the real
+        // data.
+        let num_fat_entries = (partition_size_bytes / num_bytes_per_cluster) as u32
+            + FATX_FAT_RESERVED_ENTRIES_COUNT;
         if root_cluster >= num_fat_entries {
             log::error!("Root cluster of {} exceeds cluster limit", root_cluster);
             return Err(Error::InvalidRootCluster);

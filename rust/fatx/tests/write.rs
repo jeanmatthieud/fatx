@@ -758,3 +758,81 @@ fn a_partition_that_runs_to_the_end_is_sized_against_the_device() {
     write_file(&mut fs, "/HELLO.TXT", b"open ended");
     assert_eq!(read_file(&mut fs, "/HELLO.TXT"), b"open ended");
 }
+
+/// The FAT has to make room for its reserved entry *before* the entries are
+/// widened and the total rounded up to a page.
+///
+/// The rounding hides that on most partitions, which is why nothing else here
+/// notices: 16 MiB of 16 KiB clusters is 1024 entries, 2 KiB of FAT, rounded up
+/// to one page either way. But a partition whose entries already fill a whole
+/// number of pages has nothing left to absorb the extra entry, and the FAT
+/// grows by a page — taking the cluster area with it. A real Xbox 360 hits this
+/// on its compatibility partition (256 MiB of 16 KiB clusters, 16384 entries,
+/// exactly eight pages), where reading a page early turns a full partition into
+/// an empty one and a write lands beside the data it should replace.
+///
+/// So this builds the image the way the format prescribes and asks the library
+/// to find the root directory in it; deriving the layout from the library's own
+/// arithmetic instead would prove nothing.
+#[test]
+fn a_fat_that_fills_whole_pages_still_leaves_room_for_the_reserved_entry() {
+    // 2048 entries of two bytes is exactly one page, so the reserved entry is
+    // what pushes this FAT into a second one.
+    const PARTITION: u64 = 32 * 1024 * 1024;
+    const ENTRIES: u64 = PARTITION / BYTES_PER_CLUSTER + 1;
+    const FAT_BYTES: u64 = (ENTRIES * 2).next_multiple_of(4096);
+    const NAME: &[u8] = b"ROOTDIR";
+
+    assert_eq!(FAT_BYTES, 8192, "the case this test exists for");
+
+    for variant in both_variants() {
+        let mut image = vec![0u8; PARTITION as usize];
+
+        let mut superblock = Vec::new();
+        superblock.extend_from_slice(&to_disk_u32(SIGNATURE, variant));
+        for value in [0xcafe_babeu32, SECTORS_PER_CLUSTER, ROOT_CLUSTER] {
+            superblock.extend_from_slice(&to_disk_u32(value, variant));
+        }
+        superblock.extend_from_slice(&to_disk_u16(0, variant));
+        superblock.resize(SUPERBLOCK_SIZE, 0xff);
+        image[..SUPERBLOCK_SIZE].copy_from_slice(&superblock);
+
+        let fat_at = FAT_OFFSET;
+        image[fat_at..fat_at + 2].copy_from_slice(&to_disk_u16(FAT16_MEDIA, variant));
+        image[fat_at + 2..fat_at + 4].copy_from_slice(&to_disk_u16(FAT16_END, variant));
+
+        // One directory in the root cluster, at the offset the format puts it.
+        let root_at = (FAT_OFFSET as u64 + FAT_BYTES) as usize;
+        let mut entry = vec![0xffu8; DIRENT_SIZE];
+        entry[0] = NAME.len() as u8;
+        entry[1] = 0x10; // directory
+        entry[2..2 + NAME.len()].copy_from_slice(NAME);
+        entry[44..48].copy_from_slice(&to_disk_u32(2, variant));
+        entry[48..52].copy_from_slice(&to_disk_u32(0, variant));
+        image[root_at..root_at + DIRENT_SIZE].copy_from_slice(&entry);
+        image[root_at + DIRENT_SIZE] = END_OF_DIR_MARKER;
+
+        let path = std::env::temp_dir().join(format!(
+            "fatx-reserved-entry-{variant:?}-{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&path, &image).unwrap();
+
+        let config = FatxFsConfig::new(path.to_str().unwrap().to_string())
+            .variant(variant)
+            .writable(false)
+            .partition_offset_bytes(0)
+            .partition_size_bytes(PARTITION);
+        let mut fs = FatxFs::open_device(&config).unwrap();
+        let names = listing(&mut fs, "/");
+        drop(fs);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            names,
+            vec!["ROOTDIR".to_string()],
+            "{variant:?}: the root directory was not found at {root_at:#x}, so the \
+             cluster area is a page off"
+        );
+    }
+}
