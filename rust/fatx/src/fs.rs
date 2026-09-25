@@ -222,7 +222,20 @@ impl FatxFs {
         let num_bytes_per_cluster = num_sectors_per_cluster * config.num_bytes_per_sector;
         let num_entries_per_cluster: u64 =
             num_bytes_per_cluster / (std::mem::size_of::<DirectoryEntry>() as u64);
-        let root_cluster: u32 = superblock.root_cluster.into();
+        let root_cluster: u32 = match superblock.root_cluster.into() {
+            // A 360 partition formatted for Bad Storage (FATXplorer beta 36 and
+            // later) records a root cluster of 0. The stock kernel then takes
+            // the root directory for corrupt and never writes to the partition;
+            // Bad Storage patches the kernel to use 1 instead, and remounts it.
+            // Do the same. Only this in-memory value changes: the superblock is
+            // never written back, so the 0 the console relies on stays on disk.
+            0 if variant == Variant::X360 => {
+                log::info!("Root cluster of 0: Bad Storage partition, reading it as 1");
+                1
+            }
+            0 => return Err(Error::InvalidRootCluster),
+            root_cluster => root_cluster,
+        };
 
         // Calculate FAT size
         let fat_offset_bytes = config.partition_offset_bytes + FATX_FAT_OFFSET_BYTES;
@@ -285,7 +298,11 @@ impl FatxFs {
     }
 
     pub(crate) fn cluster_to_byte_offset(&self, cluster: ClusterId) -> Result<u64, Error> {
-        if cluster >= self.num_clusters + FATX_FAT_RESERVED_ENTRIES_COUNT {
+        // Cluster 0 is the reserved entry and has no data: letting it through
+        // would wrap the subtraction below into an offset terabytes away.
+        if cluster < FATX_FAT_RESERVED_ENTRIES_COUNT
+            || cluster >= self.num_clusters + FATX_FAT_RESERVED_ENTRIES_COUNT
+        {
             return Err(Error::InvalidClusterNumber);
         }
 

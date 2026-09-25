@@ -836,3 +836,62 @@ fn a_fat_that_fills_whole_pages_still_leaves_room_for_the_reserved_entry() {
         );
     }
 }
+
+/// A 360 partition formatted for Bad Storage records a root cluster of 0, so
+/// that the stock kernel takes it for corrupt. It must read as a root cluster
+/// of 1 — what Bad Storage patches the kernel to use — and the 0 must still be
+/// on disk after a write, or the console would mount it before the exploit.
+#[test]
+fn a_bad_storage_root_cluster_of_zero_reads_as_one_and_stays_zero() {
+    let variant = Variant::X360;
+    let image = Image::new("bad-storage", variant);
+    let mut bytes = image.bytes();
+    bytes[12..16].copy_from_slice(&to_disk_u32(0, variant));
+    std::fs::write(&image.path, &bytes).unwrap();
+
+    let payload = b"Written to a Bad Storage partition.\n";
+    let mut fs = image.open(variant, true);
+    assert!(listing(&mut fs, "/").is_empty());
+    fs.mkdir("/Content").unwrap();
+    write_file(&mut fs, "/Content/GAME.BIN", payload);
+    drop(fs);
+
+    let mut fs = image.open(variant, false);
+    assert_eq!(listing(&mut fs, "/"), vec!["Content"]);
+    assert_eq!(read_file(&mut fs, "/Content/GAME.BIN"), payload);
+    drop(fs);
+
+    let bytes = image.bytes();
+    assert_eq!(
+        bytes[12..16],
+        to_disk_u32(0, variant),
+        "the superblock was rewritten"
+    );
+    // Directory entry: name length, attributes, then the name.
+    let root = &bytes[cluster_at(1) as usize..];
+    assert_eq!(
+        (root[0], &root[2..9]),
+        (7, &b"Content"[..]),
+        "the root directory is not at cluster 1"
+    );
+}
+
+/// Only the 360 has Bad Storage: on an original Xbox partition a root cluster
+/// of 0 is plain corruption, and refused.
+#[test]
+fn an_original_xbox_root_cluster_of_zero_is_refused() {
+    let variant = Variant::Xbox;
+    let image = Image::new("zero-root", variant);
+    let mut bytes = image.bytes();
+    bytes[12..16].copy_from_slice(&to_disk_u32(0, variant));
+    std::fs::write(&image.path, &bytes).unwrap();
+
+    let config = FatxFsConfig::new(image.path())
+        .variant(variant)
+        .partition_offset_bytes(0)
+        .partition_size_bytes(PARTITION_SIZE);
+    assert!(matches!(
+        FatxFs::open_device(&config),
+        Err(fatx::Error::InvalidRootCluster)
+    ));
+}
