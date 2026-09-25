@@ -851,6 +851,7 @@ fn a_bad_storage_root_cluster_of_zero_reads_as_one_and_stays_zero() {
 
     let payload = b"Written to a Bad Storage partition.\n";
     let mut fs = image.open(variant, true);
+    assert!(fs.is_bad_storage());
     assert!(listing(&mut fs, "/").is_empty());
     fs.mkdir("/Content").unwrap();
     write_file(&mut fs, "/Content/GAME.BIN", payload);
@@ -894,4 +895,19 @@ fn an_original_xbox_root_cluster_of_zero_is_refused() {
         FatxFs::open_device(&config),
         Err(fatx::Error::InvalidRootCluster)
     ));
+}
+
+/// FATXplorer's marker alone identifies a Bad Storage partition too; a plain
+/// 360 partition is not one.
+#[test]
+fn a_bad_storage_partition_is_told_by_its_marker() {
+    let variant = Variant::X360;
+    let plain = Image::new("plain", variant);
+    assert!(!plain.open(variant, false).is_bad_storage());
+
+    let marked = Image::new("marked", variant);
+    let mut bytes = marked.bytes();
+    bytes[0x858..0x860].copy_from_slice(b"BSTORAGE");
+    std::fs::write(&marked.path, &bytes).unwrap();
+    assert!(marked.open(variant, false).is_bad_storage());
 }

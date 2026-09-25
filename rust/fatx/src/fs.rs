@@ -20,6 +20,10 @@ use zerocopy::*;
 const FATX_SIGNATURE: u32 = 0x58544146; // 'FATX'
 const FATX_FAT_OFFSET_BYTES: u64 = 4096;
 const FATX_FAT_RESERVED_ENTRIES_COUNT: u32 = 1;
+/// Written by FATXplorer into the superblock of a 360 partition it formats for
+/// Bad Storage; Bad Storage itself identifies such a disk by it.
+const BAD_STORAGE_MARKER: &[u8; 8] = b"BSTORAGE";
+const BAD_STORAGE_MARKER_OFFSET: usize = 0x858;
 
 /// The first cluster a search for free space may return.
 ///
@@ -87,6 +91,8 @@ pub struct FatxFs {
     pub(crate) num_bytes_per_cluster: u64,
     pub(crate) num_entries_per_cluster: u64,
     pub(crate) root_cluster: u32,
+    /// Formatted for Bad Storage: see [`FatxFsHandle::is_bad_storage`].
+    pub(crate) bad_storage: bool,
     pub(crate) fat_offset_bytes: u64,
     pub(crate) cluster_offset_bytes: u64,
     pub(crate) fat: Fat,
@@ -222,7 +228,10 @@ impl FatxFs {
         let num_bytes_per_cluster = num_sectors_per_cluster * config.num_bytes_per_sector;
         let num_entries_per_cluster: u64 =
             num_bytes_per_cluster / (std::mem::size_of::<DirectoryEntry>() as u64);
-        let root_cluster: u32 = match superblock.root_cluster.into() {
+        let has_bad_storage_marker = superblock.as_bytes()[BAD_STORAGE_MARKER_OFFSET..]
+            .starts_with(BAD_STORAGE_MARKER);
+        let recorded_root_cluster: u32 = superblock.root_cluster.into();
+        let root_cluster: u32 = match recorded_root_cluster {
             // A 360 partition formatted for Bad Storage (FATXplorer beta 36 and
             // later) records a root cluster of 0. The stock kernel then takes
             // the root directory for corrupt and never writes to the partition;
@@ -236,6 +245,8 @@ impl FatxFs {
             0 => return Err(Error::InvalidRootCluster),
             root_cluster => root_cluster,
         };
+        let bad_storage =
+            variant == Variant::X360 && (recorded_root_cluster == 0 || has_bad_storage_marker);
 
         // Calculate FAT size
         let fat_offset_bytes = config.partition_offset_bytes + FATX_FAT_OFFSET_BYTES;
@@ -281,6 +292,7 @@ impl FatxFs {
                 num_bytes_per_cluster,
                 num_entries_per_cluster,
                 root_cluster,
+                bad_storage,
                 fat_offset_bytes,
                 cluster_offset_bytes,
                 fat,
@@ -944,5 +956,13 @@ impl FatxFsHandle {
     /// to whichever the signature turned out to be.
     pub fn variant(&self) -> Variant {
         self.with_lock(|fs| fs.variant)
+    }
+
+    /// Whether this 360 partition was formatted for Bad Storage: its
+    /// superblock records a root cluster of 0 (read as 1), or carries
+    /// FATXplorer's `BSTORAGE` marker. The console's stock kernel cannot read
+    /// such a partition until Bad Storage has run.
+    pub fn is_bad_storage(&self) -> bool {
+        self.with_lock(|fs| fs.bad_storage)
     }
 }
